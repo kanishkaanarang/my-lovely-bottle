@@ -1,0 +1,3 @@
+# Optional S3 transport. Core matching does not need network access or AWS SDKs.
+-r requirements.txt
+boto3>=1.35,<2
