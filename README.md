@@ -1,8 +1,4 @@
-# Business entity resolution · Amazon ML Challenge 2026
 
-A portable Jupyter notebook and a reusable Python pipeline for matching every Source 1 business to zero, one or many records in Sources 2 and 3. Team identity and cloud-specific settings are intentionally left unset.
-
-**Start here: [notebooks/amazon_ml_2026.ipynb](notebooks/amazon_ml_2026.ipynb).**
 
 The notebook defaults to a complete offline demo. Real-data runs use all target records for retrieval and a bounded, country-stratified sample of training anchors for supervised fitting. This is a tested implementation baseline, not a claim of competition-winning accuracy or full-scale AWS throughput.
 
