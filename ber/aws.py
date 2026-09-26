@@ -28,11 +28,12 @@ def upload(path, uri):
     boto3.client("s3").upload_file(str(path), bucket, key)
 
 
-def extract_resource(archive, destination):
+def extract_resource(archive, destination, train_only=False):
     root = Path(destination).resolve()
     root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive) as z:
-        members = [i for i in z.infolist() if i.filename.startswith("student_resource/") and not i.filename.endswith(".DS_Store")]
+        prefix = "student_resource/dataset/train/" if train_only else "student_resource/"
+        members = [i for i in z.infolist() if i.filename.startswith(prefix) and not i.filename.endswith(".DS_Store")]
         for member in members:
             target = (root/member.filename).resolve()
             if not target.is_relative_to(root) or (member.external_attr >> 16) & 0o170000 == 0o120000:

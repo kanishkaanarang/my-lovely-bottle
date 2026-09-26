@@ -13,8 +13,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import digest, file_hash, records, write_json
-from .features import features
+from .common import TSV, digest, file_hash, records, write_json
+from .decision import decide
+from .features import features, FEATURE_NAMES
 from .retrieval import Retriever, RetrievalConfig
 from .training import choose, load_model, predict_proba
 
@@ -22,69 +23,153 @@ MATCH_HEADER = ["source1_entity_id", "matched_entity_ids"]
 CANDIDATE_HEADER = ["source1_entity_id", "candidate_entity_ids"]
 
 
-def predict(source1, index_dir, model_path, output_dir, batch_size=500, limit=None):
-    """One independent atomic directory per batch. Resume requires identical inputs."""
-    if batch_size < 1 or (limit is not None and limit < 1):
-        raise ValueError("Invalid batch_size/limit")
+_WORKER = None
+
+
+def _worker_init(index_dir, model_path, threads):
+    global _WORKER
+    from threadpoolctl import threadpool_limits
+    limiter = threadpool_limits(limits=threads)
+    bundle = load_model(model_path)
+    retriever = Retriever(index_dir, RetrievalConfig(**bundle["retrieval"]))
+    if retriever.manifest["language_hash"] != bundle["language_hash"]:
+        raise ValueError("Index language mapping differs from trained model")
+    _WORKER = retriever, bundle, limiter
+
+
+def _batch(task):
+    number, anchors, shards, signature = task
+    retriever, bundle, _ = _WORKER
+    folder = Path(shards)/f"{number:07d}"
+    ids_hash = digest([a.entity_id for a in anchors])
+    if folder.exists():
+        meta = json.loads((folder/"complete.json").read_text())
+        if meta["ids_hash"] != ids_hash or meta["signature"] != signature:
+            raise ValueError("Mismatched inference shard")
+        for name in ("matching.tsv", "candidates.tsv"):
+            if file_hash(folder/name) != meta["hashes"][name]:
+                raise ValueError("Corrupt completed shard")
+        meta["reused"] = True
+        return meta
+    temporary = Path(shards)/f"{number:07d}.partial"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir()
+    candidate_groups = [retriever.exact_union(a) if bundle.get("kind") == "exact_union" else retriever.retrieve(a) for a in anchors]
+    matrices = [np.zeros((len(cs), len(FEATURE_NAMES)), np.float32) if bundle.get("kind") == "exact_union" else features(a, cs) for a, cs in zip(anchors, candidate_groups)]
+    combined = np.concatenate(matrices)
+    score_rows, score_offset = [], 0
+    for a, cs in zip(anchors, candidate_groups):
+        score_rows.append({"offset": score_offset, "count": len(cs), "candidates": [c.record.entity_id for c in cs]})
+        score_offset += len(cs)
+    probs = predict_proba(bundle, combined, score_rows)
+    offset = 0
+    drift = {}
+    with (temporary/"matching.tsv").open("w", encoding="utf-8", newline="") as mf, (temporary/"candidates.tsv").open("w", encoding="utf-8", newline="") as cf:
+        mw, cw = csv.writer(mf, **TSV, lineterminator="\n"), csv.writer(cf, **TSV, lineterminator="\n")
+        for anchor, cs in zip(anchors, candidate_groups):
+            ids = [c.record.entity_id for c in cs]
+            p = probs[offset:offset+len(ids)]
+            row = {"candidates": ids, "country": anchor.country, "address_missing": not anchor.a,
+                   "channel_agreement": max((len(c.channels) for c in cs), default=0)}
+            pred = ([c.record.entity_id for c in cs if c.channels & {"exact_n", "exact_a"}]
+                    if bundle.get("kind") == "exact_union" else decide(bundle, row, p))
+            cw.writerow([anchor.entity_id, ",".join(ids)])
+            mw.writerow([anchor.entity_id, ",".join(pred)])
+            stats = drift.setdefault(anchor.country, {"anchors": 0, "empty": 0, "candidate_hist": [0]*8, "top_score_hist": [0]*10})
+            stats["anchors"] += 1
+            stats["empty"] += not pred
+            stats["candidate_hist"][min(7, int(np.log2(len(ids)+1)))] += 1
+            stats["top_score_hist"][min(9, int(max(p, default=0)*10))] += 1
+            offset += len(ids)
+    meta = {"signature": signature, "ids_hash": ids_hash, "anchors": len(anchors), "drift": drift,
+            "pairs": len(combined), "hashes": {n: file_hash(temporary/n) for n in ("matching.tsv", "candidates.tsv")}}
+    write_json(temporary/"complete.json", meta)
+    temporary.replace(folder)
+    return meta
+
+
+def predict(source1, index_dir, model_path, output_dir, batch_size=500, limit=None, workers=1):
+    """Bounded process pool; each worker owns a read-only SQLite connection."""
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+    import platform
+    from .training import sample_anchors
+    if batch_size < 1 or workers < 1 or (limit is not None and limit < 1):
+        raise ValueError("Invalid batch_size/workers/limit")
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     bundle = load_model(model_path)
-    retriever = Retriever(index_dir, RetrievalConfig(**bundle["retrieval"]))
+    manifest = json.loads((Path(index_dir)/"manifest.json").read_text())
+    if manifest["language_hash"] != bundle["language_hash"]:
+        raise ValueError("Index language mapping differs from trained model")
+    if manifest.get("disabled_views", []) != bundle.get("disabled_views", []):
+        raise ValueError("Index normalization differs from trained model")
     signature = digest({"model": file_hash(model_path), "source1": file_hash(source1),
-                        "index": retriever.manifest["fingerprint"], "batch_size": batch_size,
-                        "limit": limit, "retrieval": bundle["retrieval"]})
+                        "index": manifest["fingerprint"], "batch_size": batch_size,
+                        "limit": limit, "retrieval": bundle["retrieval"], "sampling": "country_reservoir_v3"})
     state_path = root/"inference_manifest.json"
     if state_path.exists() and json.loads(state_path.read_text())["signature"] != signature:
         raise ValueError("Prediction configuration changed; use a new output directory")
     write_json(state_path, {"signature": signature, "limit": limit, "complete": False})
     shards = root/"shards"
     shards.mkdir(exist_ok=True)
-    iterator = iter(records(source1))
-    if limit is not None:
-        iterator = itertools.islice(iterator, limit)
-    started, batches, total, pair_count = time.monotonic(), [], 0, 0
-    try:
+    sampling_started = time.monotonic()
+    if limit is None:
+        iterator = iter(records(source1))
+    else:
+        sampled, population = sample_anchors(source1, per_country=limit, seed=2026)
+        # Country reservoirs, then population-weighted mixing. Shuffle each pool
+        # before truncation so sorted entity IDs do not bias the benchmark.
+        from collections import defaultdict
+        import random
+        groups = defaultdict(list)
+        for a in sampled:
+            groups[a.country].append(a)
+        rng = random.Random(2026)
+        for group in groups.values(): rng.shuffle(group)
+        chosen = [group.pop() for group in groups.values() if group][:limit]
+        while len(chosen) < min(limit, sum(population.values())):
+            available = [c for c in groups if groups[c]]
+            if not available: break
+            country = rng.choices(available, weights=[population[c] for c in available])[0]
+            chosen.append(groups[country].pop())
+        rng.shuffle(chosen)
+        iterator = iter(chosen)
+    sampling_seconds = time.monotonic()-sampling_started
+    def tasks():
         for number in itertools.count():
             anchors = list(itertools.islice(iterator, batch_size))
             if not anchors:
                 break
-            folder = shards/f"{number:07d}"
-            ids_hash = digest([a.entity_id for a in anchors])
-            if folder.exists():
-                meta = json.loads((folder/"complete.json").read_text())
-                if meta["ids_hash"] != ids_hash or meta["signature"] != signature:
-                    raise ValueError("Mismatched inference shard")
-                for name in ("matching.tsv", "candidates.tsv"):
-                    if file_hash(folder/name) != meta["hashes"][name]:
-                        raise ValueError("Corrupt completed shard")
-            else:
-                temporary = shards/f"{number:07d}.partial"
-                if temporary.exists():
-                    shutil.rmtree(temporary)
-                temporary.mkdir()
-                candidate_groups = [retriever.retrieve(a) for a in anchors]
-                matrices = [features(a, cs) for a, cs in zip(anchors, candidate_groups)]
-                combined = np.concatenate(matrices)
-                probs = predict_proba(bundle, combined)
-                offset = 0
-                with (temporary/"matching.tsv").open("w", encoding="utf-8", newline="") as mf, (temporary/"candidates.tsv").open("w", encoding="utf-8", newline="") as cf:
-                    mw, cw = csv.writer(mf, delimiter="\t", lineterminator="\n"), csv.writer(cf, delimiter="\t", lineterminator="\n")
-                    for anchor, cs in zip(anchors, candidate_groups):
-                        ids = [c.record.entity_id for c in cs]
-                        pred = choose(ids, probs[offset:offset+len(ids)], bundle["threshold"], bundle["empty_gate"])
-                        # This is the exact final set supplied to the model, not the raw FTS output.
-                        cw.writerow([anchor.entity_id, ",".join(ids)])
-                        mw.writerow([anchor.entity_id, ",".join(pred)])
-                        offset += len(ids)
-                meta = {"signature": signature, "ids_hash": ids_hash, "anchors": len(anchors),
-                        "pairs": len(combined), "hashes": {n: file_hash(temporary/n) for n in ("matching.tsv", "candidates.tsv")}}
-                write_json(temporary/"complete.json", meta)
-                temporary.replace(folder)
-            batches.append(folder)
-            total += len(anchors); pair_count += meta["pairs"]
-            print(f"Prediction: {total:,} anchors / {pair_count:,} pairs ({time.monotonic()-started:.1f}s this call)", flush=True)
+            yield number, anchors, str(shards), signature
+    started, batches, total, pair_count, drift = time.monotonic(), [], 0, 0, {}
+    reused_batches = 0
+    executor = None
+    try:
+        if workers > 1:
+            executor = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                         initializer=_worker_init, initargs=(str(index_dir), str(model_path), 1))
+        else:
+            _worker_init(index_dir, model_path, 1)
+        pending = iter(tasks())
+        while True:
+            window = list(itertools.islice(pending, max(1, workers*2)))
+            if not window:
+                break
+            results = executor.map(_batch, window) if executor else map(_batch, window)
+            for task, meta in zip(window, results):
+                batches.append(shards/f"{task[0]:07d}")
+                reused_batches += bool(meta.get("reused"))
+                total += meta["anchors"]
+                pair_count += meta["pairs"]
+                for country, counts in meta["drift"].items():
+                    target = drift.setdefault(country, {"anchors": 0, "empty": 0, "candidate_hist": [0]*8, "top_score_hist": [0]*10})
+                    for key, value in counts.items():
+                        target[key] = [a+b for a, b in zip(target[key], value)] if isinstance(value, list) else target[key]+value
+            print(f"Prediction: {total:,} anchors / {pair_count:,} pairs ({time.monotonic()-started:.1f}s)", flush=True)
         for output_name, shard_name, header in (("matching_results.tsv", "matching.tsv", MATCH_HEADER),
-                                                 ("candidate_pairs.tsv", "candidates.tsv", CANDIDATE_HEADER)):
+                                               ("candidate_pairs.tsv", "candidates.tsv", CANDIDATE_HEADER)):
             temporary = root/(output_name+".tmp")
             with temporary.open("w", encoding="utf-8", newline="") as out:
                 out.write("\t".join(header)+"\n")
@@ -92,14 +177,20 @@ def predict(source1, index_dir, model_path, output_dir, batch_size=500, limit=No
                     with (folder/shard_name).open(encoding="utf-8") as f:
                         shutil.copyfileobj(f, out)
             temporary.replace(root/output_name)
-        result = {"signature": signature, "complete": True, "limit": limit, "anchors": total,
-                  "pairs": pair_count, "seconds_this_call": time.monotonic()-started,
-                  "source1_sha256": file_hash(source1), "index_fingerprint": retriever.manifest["fingerprint"],
-                  "model_sha256": file_hash(model_path), "batch_size": batch_size}
+        result = {"signature": signature, "complete": True, "limit": limit, "anchors": total, "drift": drift,
+                  "pairs": pair_count, "seconds_this_call": time.monotonic()-started, "sampling_seconds": sampling_seconds,
+                  "source1_sha256": file_hash(source1), "index_fingerprint": manifest["fingerprint"],
+                  "model_sha256": file_hash(model_path), "batch_size": batch_size, "workers": workers,
+                  "reused_batches": reused_batches, "valid_fresh_benchmark": limit is not None and reused_batches == 0,
+                  "hardware": {"platform": platform.platform(), "cpu_count": __import__("os").cpu_count()}}
         write_json(state_path, result)
         return result
     finally:
-        retriever.close()
+        if executor:
+            executor.shutdown(wait=True, cancel_futures=True)
+        elif _WORKER is not None:
+            _WORKER[0].close()
+            _WORKER[2].restore_original_limits()
 
 
 def validate(source1, index_dir, output_dir):
@@ -117,7 +208,7 @@ def validate(source1, index_dir, output_dir):
         seen.execute("CREATE TABLE seen(id TEXT PRIMARY KEY)")
         try:
             with (root/"matching_results.tsv").open(encoding="utf-8", newline="") as mf, (root/"candidate_pairs.tsv").open(encoding="utf-8", newline="") as cf:
-                mr, cr = csv.reader(mf, delimiter="\t"), csv.reader(cf, delimiter="\t")
+                mr, cr = csv.reader(mf, **TSV), csv.reader(cf, **TSV)
                 if next(mr, None) != MATCH_HEADER or next(cr, None) != CANDIDATE_HEADER:
                     raise ValueError("Incorrect output headers")
                 for anchor, m, c in itertools.zip_longest(records(source1), mr, cr):
@@ -144,7 +235,7 @@ def validate(source1, index_dir, output_dir):
             retriever.close()
 
 
-def package_submission(repo_dir, output_dir, model_path, destination):
+def package_submission(repo_dir, output_dir, model_path, destination, require_official=False):
     repo, output = Path(repo_dir), Path(output_dir)
     validation = json.loads((output/"validation.json").read_text())
     if validation["status"] != "PASS":
@@ -157,6 +248,10 @@ def package_submission(repo_dir, output_dir, model_path, destination):
     for n, h in validation["files"].items():
         if file_hash(output/n) != h:
             raise ValueError("Output changed after validation")
+    if require_official:
+        official = json.loads((output/"official_validation.json").read_text())
+        if official["returncode"] or official.get("output_hashes") != validation["files"]:
+            raise ValueError("Official validator must pass on these exact output files")
     documentation = repo/"Documentation_template.md"
     if "[FILL" in documentation.read_text():
         raise ValueError("Complete Documentation_template.md before packaging")
@@ -167,9 +262,25 @@ def package_submission(repo_dir, output_dir, model_path, destination):
         for file in sorted((repo/"ber").glob("*.py")):
             z.write(file, "code/business_entity_resolution/src/ber/"+file.name)
         z.write(model_path, "code/business_entity_resolution/model.pkl")
+        bundle = load_model(model_path)
+        z.writestr("code/business_entity_resolution/language.json", json.dumps(bundle.get("language", {}), ensure_ascii=False))
         for name in ("requirements.txt", "LICENSE", "SUBMISSION_README.md"):
             z.write(repo/name, "code/business_entity_resolution/"+("README.md" if name == "SUBMISSION_README.md" else name))
         z.write(documentation, "Documentation_template.md")
-        z.writestr("code/business_entity_resolution/inference_config.json", json.dumps({"batch_size": state["batch_size"], "model_sha256": state["model_sha256"]}, indent=2))
+        z.writestr("code/business_entity_resolution/inference_config.json", json.dumps({"batch_size": state["batch_size"], "model_sha256": state["model_sha256"],
+                    "disabled_views": bundle.get("disabled_views", []), "language_hash": bundle["language_hash"]}, indent=2))
     temporary.replace(destination)
     return str(destination)
+
+
+def fallback(source1, index_dir, output_dir, workers=1):
+    """Uncapped normalized exact-name/address union. Low precision emergency baseline."""
+    import pickle
+    root = Path(output_dir); root.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads((Path(index_dir)/"manifest.json").read_text())
+    bundle = {"kind": "exact_union", "features": FEATURE_NAMES,
+              "retrieval": asdict(RetrievalConfig()), "language_hash": manifest["language_hash"],
+              "language": json.loads((Path(index_dir)/"language.json").read_text()), "disabled_views": manifest.get("disabled_views", [])}
+    model = root/"fallback.pkl"
+    with model.open("wb") as f: pickle.dump(bundle, f)
+    return predict(source1, index_dir, model, root, workers=workers)

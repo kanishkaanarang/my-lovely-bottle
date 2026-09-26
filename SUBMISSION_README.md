@@ -7,7 +7,7 @@ With Python 3.11–3.13 and SQLite FTS5:
 ```bash
 python -m pip install -r requirements.txt
 export PYTHONPATH="$PWD/src"
-python -m ber index --data /path/to/dataset --split test --index work/index_test
+python -m ber index --data /path/to/dataset --split test --index work/index_test --language language.json
 python -m ber predict --data /path/to/dataset --index work/index_test --model model.pkl --output output --batch-size 500
 python -m ber validate --data /path/to/dataset --index work/index_test --output output
 ```

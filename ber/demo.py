@@ -3,7 +3,7 @@
 import csv
 from pathlib import Path
 
-from .common import FIELDS
+from .common import FIELDS, TSV
 
 
 def make_demo(root, train_per_country=160, test_per_country=12):
@@ -48,10 +48,10 @@ def make_demo(root, train_per_country=160, test_per_country=12):
                 truth.append([aid, ",".join(ids)])
         for src, rows in data.items():
             with (folder/f"{split}_source{src}.tsv").open("w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f, delimiter="\t", lineterminator="\n")
+                writer = csv.writer(f, **TSV, lineterminator="\n")
                 writer.writerow(FIELDS); writer.writerows(rows)
         if split == "train":
             with (folder/"train_ground_truth.tsv").open("w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f, delimiter="\t", lineterminator="\n")
+                writer = csv.writer(f, **TSV, lineterminator="\n")
                 writer.writerow(["source1_entity_id", "matched_entity_ids"]); writer.writerows(truth)
     return root

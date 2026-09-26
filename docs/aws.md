@@ -1,5 +1,12 @@
 # Running on AWS
 
+For the robustness revision, start with [robust_run.md](robust_run.md). Full
+mode now defaults to `TRAIN_ONLY=True`; test indexing and inference are gated.
+Use a new schema-3 working directory and the pilot profile before the large
+200k-anchor-per-country profile. Neither profile has a verified AWS cost/time
+estimate. Geographic stress is enabled by default and rebuilds language/index
+artifacts, which adds substantial work.
+
 Use an existing SageMaker Studio JupyterLab space or an EC2 instance with Jupyter and a persistent EBS volume. This project creates no infrastructure. The first implementation uses CPU search and tree fitting; a GPU does not accelerate its SQLite index.
 
 1. Clone the repository into your notebook workspace.

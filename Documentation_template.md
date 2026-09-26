@@ -16,7 +16,7 @@ Dataset audit findings motivating the approach: large target pools, multiple tru
 
 ## 3. Candidate generation
 
-SQLite FTS5 indexes are partitioned by observed country. Candidate channels are normalized exact name/address, suffix-reduced name, BM25 name/address and name character trigrams. Ambiguous anchors receive larger candidate budgets. The final candidates are capped per source before model inference and exported exactly as scored.
+SQLite FTS5 indexes are partitioned by country. Multiple exact, BM25 and character channels use original, folded, suffix-reduced, sorted, compact, expanded-address and training-only romanized views. Postcodes and house/street keys provide additional candidates. Per-channel reservations and reciprocal-rank filling preserve complementary candidates. Final candidates are capped per source and exported exactly as scored.
 
 - Final retrieval settings: [FILL]
 - True-link retrieval recall / complete-set retrieval / oracle macro F0.5: [FILL]
@@ -24,7 +24,7 @@ SQLite FTS5 indexes are partitioned by observed country. Candidate channels are 
 
 ## 4. Matching and validation
 
-The model is histogram gradient boosting on name/address similarity, digit evidence, missingness, source and retrieval context. Hard negatives come from the inference-style blocker. Anchors are divided by normalized signature into training, calibration and trust sets. Calibration is further divided for probability transformation and threshold/empty-gate tuning.
+The default model is histogram gradient boosting on text, frequency/IDF, structured-number, script, missingness and retrieval evidence. Hard negatives come from the inference-style blocker. A grouped, country/cardinality-stratified 60/20/20 split separates training, calibration and trust. Calibration groups are divided again for probability/gate fitting and policy tuning. The default decision policy uses country/source thresholds and a learned anchor gate; unseen-country settings use a worst-country calibration objective. Record any optional model/decoder experiments actually selected below.
 
 - Training sample and exact split seed/config: [FILL]
 - Model settings and decision thresholds: [FILL]
@@ -42,4 +42,4 @@ Runnable code, model, requirements and inference instructions are included under
 
 ## 6. Limitations
 
-Current retrieval preserves scripts but does not transliterate. Cross-script matching relies substantially on address evidence. Exact-signature splits do not eliminate every near-duplicate relationship. No French accuracy can be measured from the supplied labels. [FILL additional observed limitations and future work]
+Cross-script aliases and character mappings are learned only from training-fold pairs. Their coverage is limited by observed training examples, and unknown characters are preserved. No external transliteration corpus or pretrained multilingual encoder is loaded. Exact-signature splits do not eliminate every near-duplicate relationship. No French accuracy can be measured from the supplied labels. [FILL additional observed limitations and future work]

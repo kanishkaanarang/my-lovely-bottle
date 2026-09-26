@@ -6,6 +6,9 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+import subprocess
+import os
+import sys
 from pathlib import Path
 
 from ber.aws import extract_resource
@@ -73,8 +76,26 @@ class EndToEndTests(unittest.TestCase):
                 self.assertIn('output/candidate_pairs.tsv', z.namelist())
                 self.assertIn('code/business_entity_resolution/src/ber/__main__.py', z.namelist())
                 self.assertIn('code/business_entity_resolution/model.pkl', z.namelist())
+                z.extractall(root/'clean_package')
+            packaged = root/'clean_package/code/business_entity_resolution'
+            env = dict(os.environ)
+            env['PYTHONPATH'] = str(packaged/'src') + os.pathsep + env.get('PYTHONPATH', '')
+            clean_index = root/'clean_index'
+            rebuilt = subprocess.run([sys.executable, '-m', 'ber', 'index', '--data', str(data),
+                '--split', 'test', '--index', str(clean_index), '--language', str(packaged/'language.json')],
+                cwd=packaged, env=env, capture_output=True, text=True)
+            self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+            clean = subprocess.run([sys.executable, '-m', 'ber', 'predict', '--data', str(data),
+                '--index', str(clean_index), '--model', str(packaged/'model.pkl'), '--output', str(root/'clean_output'),
+                '--batch-size', '7'], cwd=packaged, env=env, capture_output=True, text=True)
+            self.assertEqual(clean.returncode, 0, clean.stderr)
+            self.assertEqual((root/'clean_output/matching_results.tsv').read_bytes(), (output/'matching_results.tsv').read_bytes())
             benchmark = root/'benchmark'
-            predict(data/'test/test_source1.tsv', test_index, model, benchmark, limit=3)
+            timed = predict(data/'test/test_source1.tsv', test_index, model, benchmark, limit=3)
+            self.assertTrue(timed['valid_fresh_benchmark'])
+            self.assertEqual(set(timed['drift']), {'US', 'India', 'France'})
+            resumed = predict(data/'test/test_source1.tsv', test_index, model, benchmark, limit=3)
+            self.assertFalse(resumed['valid_fresh_benchmark'])
             with self.assertRaises(ValueError):
                 validate(data/'test/test_source1.tsv', test_index, benchmark)
             lines = (output/'matching_results.tsv').read_text().splitlines()
